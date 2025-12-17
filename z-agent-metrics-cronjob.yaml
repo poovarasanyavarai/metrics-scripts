@@ -1,0 +1,67 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: z-agent-metrics
+  namespace: default
+  labels:
+    app: z-agent-metrics
+    component: analytics
+spec:
+  schedule: '*/5 * * * *'  # Run every 5 minutes
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  suspend: false
+  jobTemplate:
+    metadata:
+      labels:
+        app: z-agent-metrics
+    spec:
+      template:
+        metadata:
+          labels:
+            app: z-agent-metrics
+        spec:
+          volumes:
+            - name: logs
+              emptyDir: {}
+          containers:
+            - name: z-agent-metrics
+              image: zinfradevv1.azurecr.io/z-agent-metrics:latest  # Your built and pushed image
+              imagePullPolicy: Always
+              env:
+                - name: CONFIG_STORE_BASE_URL
+                  value: https://z-config-store.48.216.130.212.nip.io
+                - name: CONFIG_STORE_API_KEY
+                  value: 891f41ee454479c49e458c4a7c50dd1e
+                - name: DATABASE_URL
+                  value: >-
+                    postgresql://z_agent_user:z_agent_password@postgresql-shared:5432/z_agent
+                - name: LOG_LEVEL
+                  value: INFO
+                - name: PYTHONPATH
+                  value: /app
+              resources:
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+                requests:
+                  cpu: 200m
+                  memory: 256Mi
+              volumeMounts:
+                - name: logs
+                  mountPath: /app/logs
+              securityContext:
+                capabilities:
+                  drop:
+                    - ALL
+                runAsNonRoot: false
+                readOnlyRootFilesystem: false
+                allowPrivilegeEscalation: false
+              terminationMessagePath: /dev/termination-log
+              terminationMessagePolicy: File
+          restartPolicy: OnFailure
+          terminationGracePeriodSeconds: 30
+          activeDeadlineSeconds: 600
+          dnsPolicy: ClusterFirst
+          schedulerName: default-scheduler
