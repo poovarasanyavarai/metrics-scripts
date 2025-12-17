@@ -27,13 +27,13 @@ def get_db_connection():
 
 
 def fetch_all_data_optimized(chatbot_ids, conn, language_map=None):
-    """Fetch all data with just 3 queries using IN operator"""
+    """Fetch all data with just 5 queries using IN operator"""
     logger.info(f"Fetching optimized data for {len(chatbot_ids)} chatbots")
     cursor = conn.cursor()
 
     # Convert chatbot_ids to string for IN clause
     chatbot_ids_str = "', '".join(chatbot_ids)
-    logger.debug(f"Executing 3 optimized queries for {len(chatbot_ids)} chatbots")
+    logger.debug(f"Executing 5 optimized queries for {len(chatbot_ids)} chatbots")
 
     # Query 1: Get all today's conversations (full data needed for language/platform analysis)
     today_conversations_query = f"""
@@ -75,6 +75,28 @@ def fetch_all_data_optimized(chatbot_ids, conn, language_map=None):
         ORDER BY f.chatbot_id, f.created_at DESC
     """
 
+    # Query 4: Get today's leads from event_scheduler
+    today_leads_query = f"""
+        SELECT chatbot_id, COUNT(*) AS today_leads_count
+        FROM public.event_scheduler
+        WHERE chatbot_id IN ('{chatbot_ids_str}')
+          AND start_time >= CURRENT_DATE
+          AND start_time < CURRENT_DATE + INTERVAL '1 day'
+        GROUP BY chatbot_id
+        ORDER BY chatbot_id
+    """
+
+    # Query 5: Get yesterday's leads from event_scheduler
+    yesterday_leads_query = f"""
+        SELECT chatbot_id, COUNT(*) AS yesterday_leads_count
+        FROM public.event_scheduler
+        WHERE chatbot_id IN ('{chatbot_ids_str}')
+          AND start_time >= CURRENT_DATE - INTERVAL '1 day'
+          AND start_time < CURRENT_DATE
+        GROUP BY chatbot_id
+        ORDER BY chatbot_id
+    """
+
     try:
         # Execute today's conversations query
         logger.debug("Executing today's conversations query")
@@ -94,6 +116,39 @@ def fetch_all_data_optimized(chatbot_ids, conn, language_map=None):
         cursor.execute(feedback_query)
         feedback_results = cursor.fetchall()
         logger.info(f"Retrieved {len(feedback_results)} feedback records")
+
+        
+        # Execute leads queries with separate connection to avoid transaction issues
+        today_leads_results = []
+        yesterday_leads_results = []
+
+        try:
+            # Create separate connection for leads queries
+            leads_conn = get_db_connection()
+            leads_cursor = leads_conn.cursor()
+
+            # Execute today's leads query
+            logger.debug("Executing today's leads query")
+            leads_cursor.execute(today_leads_query)
+            today_leads_results = leads_cursor.fetchall()
+            logger.info(f"Retrieved today leads for {len(today_leads_results)} chatbots")
+
+            # Execute yesterday's leads query
+            logger.debug("Executing yesterday's leads query")
+            leads_cursor.execute(yesterday_leads_query)
+            yesterday_leads_results = leads_cursor.fetchall()
+            logger.info(f"Retrieved yesterday leads for {len(yesterday_leads_results)} chatbots")
+
+            leads_cursor.close()
+            leads_conn.close()
+
+        except psycopg2.Error as e:
+            if "does not exist" in str(e):
+                logger.warning("event_scheduler table does not exist, using 0 for all leads")
+                # Leave results empty - will default to 0
+            else:
+                logger.warning(f"Leads query error (using 0 for leads): {str(e)}")
+                # Leave results empty - will default to 0
 
         cursor.close()
     except psycopg2.Error as e:
@@ -208,27 +263,30 @@ def fetch_all_data_optimized(chatbot_ids, conn, language_map=None):
         else:
             feedback_by_chatbot[chatbot_id]['fb_channel'] = []
 
-    return today_conversations, yesterday_conversations, feedback_by_chatbot
+    # Process leads data
+    today_leads = {}
+    yesterday_leads = {}
+
+    # Process today's leads
+    for row in today_leads_results:
+        chatbot_id, count = row
+        today_leads[chatbot_id] = count
+
+    # Process yesterday's leads
+    for row in yesterday_leads_results:
+        chatbot_id, count = row
+        yesterday_leads[chatbot_id] = count
+
+    return today_conversations, yesterday_conversations, feedback_by_chatbot, today_leads, yesterday_leads
 
 
-def insert_metrics_to_db(json_file_path):
-    """Insert metrics data from JSON file into chatbot_metrics table"""
-    logger.info(f"Loading metrics data from {json_file_path}")
-
-    try:
-        with open(json_file_path, 'r') as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        logger.error(f"JSON file not found: {json_file_path}")
-        return False
-    except json.JSONDecodeError as e:
-        logger.error(f"Error parsing JSON file: {str(e)}")
-        return False
-
+def insert_metrics_direct(data):
+    """Insert metrics data directly into chatbot_metrics table without JSON file"""
     if 'chatbot_metrics' not in data:
-        logger.error("Invalid JSON structure: 'chatbot_metrics' key not found")
+        logger.error("Invalid data structure: 'chatbot_metrics' key not found")
         return False
 
+    logger.info(f"Fast batch inserting {len(data['chatbot_metrics'])} metrics records")
     conn = None
     cursor = None
     inserted_count = 0
@@ -237,49 +295,7 @@ def insert_metrics_to_db(json_file_path):
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Create the chatbot_metrics table if it doesn't exist
-        create_table_query = """
-        CREATE TABLE IF NOT EXISTS chatbot_metrics (
-            id BIGSERIAL PRIMARY KEY,
-            snapshot_time TIMESTAMP NOT NULL,
-            chatbot_id UUID NOT NULL,
-            profile_url TEXT,
-            active_status BOOLEAN,
-            total_coversation INTEGER DEFAULT 0,
-            coversation_diff INTEGER DEFAULT 0,
-            ai_resolved INTEGER DEFAULT 0,
-            ai_resolved_diff INTEGER DEFAULT 0,
-            human_resolved INTEGER DEFAULT 0,
-            human_resolved_diff INTEGER DEFAULT 0,
-            leads INTEGER DEFAULT 0,
-            leads_diff INTEGER DEFAULT 0,
-            ai_csat INTEGER DEFAULT 0,
-            human_csat INTEGER DEFAULT 0,
-            platform JSONB,
-            ongoing_calls INTEGER DEFAULT 0,
-            in_queue INTEGER DEFAULT 0,
-            unresolved INTEGER DEFAULT 0,
-            feedback_total INTEGER DEFAULT 0,
-            feedback_pos INTEGER DEFAULT 0,
-            feedback_neg INTEGER DEFAULT 0,
-            feedback_avg INTEGER DEFAULT 0,
-            languages JSONB,
-            alerts JSONB,
-            fb_geo JSONB,
-            fb_channel JSONB,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """
-        cursor.execute(create_table_query)
-
-        # Create index on chatbot_id and snapshot_time for better performance
-        index_query = """
-        CREATE INDEX IF NOT EXISTS idx_chatbot_metrics_chatbot_snapshot
-        ON chatbot_metrics (chatbot_id, snapshot_time);
-        """
-        cursor.execute(index_query)
-
-        # Prepare insert query without id (auto-generated)
+        # Prepare insert query without id (auto-generated) - match actual table column order
         insert_query = """
         INSERT INTO chatbot_metrics (
             snapshot_time, chatbot_id, profile_url, active_status,
@@ -292,122 +308,8 @@ def insert_metrics_to_db(json_file_path):
             bot_created_at, perform_by_geo
         ) VALUES (
             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s
-        );
-        """
-
-        logger.info(f"Inserting {len(data['chatbot_metrics'])} metrics records")
-
-        for metric in data['chatbot_metrics']:
-            try:
-                # Convert JSON objects to JSON strings for database insertion
-                platform_json = json.dumps(metric.get('platform', {}))
-                languages_json = json.dumps(metric.get('languages', {}))
-                alerts_json = json.dumps(metric.get('alerts', []))
-                fb_geo_json = json.dumps(metric.get('fb_geo', []))
-                fb_channel_json = json.dumps(metric.get('fb_channel', []))
-
-                values = (
-                    metric.get('snapshot_time'),
-                    metric.get('chatbot_id'),
-                    metric.get('profile_url'),
-                    metric.get('active_status'),
-                    metric.get('total_coversation', 0),
-                    metric.get('coversation_diff', 0),
-                    metric.get('ai_resolved', 0),
-                    metric.get('ai_resolved_diff', 0),
-                    metric.get('human_resolved', 0),
-                    metric.get('human_resolved_diff', 0),
-                    metric.get('leads', 0),
-                    metric.get('leads_diff', 0),
-                    metric.get('ai_csat', 0),
-                    metric.get('human_csat', 0),
-                    platform_json,
-                    metric.get('ongoing_calls', 0),
-                    metric.get('in_queue', 0),
-                    metric.get('unresolved', 0),
-                    metric.get('feedback_total', 0),
-                    metric.get('feedback_pos', 0),
-                    metric.get('feedback_neg', 0),
-                    metric.get('feedback_avg', 0),
-                    languages_json,
-                    alerts_json,
-                    fb_geo_json,
-                    fb_channel_json,
-                    json.dumps(metric.get('trends', [])),
-                    metric.get('net_impact', 0.0),  # Double precision value
-                    json.dumps(metric.get('net_impact_graph', {})),
-                    metric.get('chatbot_name', ''),  # 'name' column
-                    metric.get('snapshot_time'),  # created_at same as snapshot_time
-                    metric.get('bot_created_at', metric.get('snapshot_time')),  # Default to snapshot_time
-                    json.dumps(metric.get('perform_by_geo', {}))
-                )
-
-                cursor.execute(insert_query, values)
-                inserted_count += 1
-
-            except Exception as e:
-                logger.error(f"Error inserting record for chatbot_id {metric.get('chatbot_id')}: {str(e)}")
-                continue
-
-        # Commit the transaction
-        conn.commit()
-        logger.info(f"Successfully inserted {inserted_count} metrics records")
-        return True
-
-    except psycopg2.Error as e:
-        if conn:
-            conn.rollback()
-        logger.error(f"Database error during insertion: {str(e)}")
-        return False
-
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
-        logger.info("Database connection closed")
-
-
-def insert_metrics_direct(data):
-    """Insert metrics data directly into chatbot_metrics table without JSON file"""
-    print("INSERT_METRICS_DIRECT: Function started")
-    logger.info("INSERT_METRICS_DIRECT: Function started")
-    if 'chatbot_metrics' not in data:
-        logger.error("Invalid data structure: 'chatbot_metrics' key not found")
-        return False
-
-    print(f"INSERT_METRICS_DIRECT: Found {len(data['chatbot_metrics'])} records to insert")
-    logger.info(f"INSERT_METRICS_DIRECT: Found {len(data['chatbot_metrics'])} records to insert")
-    conn = None
-    cursor = None
-    inserted_count = 0
-
-    try:
-        logger.info("INSERT_METRICS_DIRECT: Getting database connection...")
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        logger.info("INSERT_METRICS_DIRECT: Database connection established")
-
-        # Skip table creation and index creation for speed - assume table exists
-        logger.info("INSERT_METRICS_DIRECT: Skipping table/index creation for speed")
-
-        # Prepare insert query without id (auto-generated) - match our optimized column order
-        insert_query = """
-        INSERT INTO chatbot_metrics (
-            snapshot_time, chatbot_id, profile_url, active_status,
-            total_coversation, coversation_diff, ai_resolved, ai_resolved_diff,
-            human_resolved, human_resolved_diff, leads, leads_diff,
-            ai_csat, human_csat, platform, ongoing_calls, in_queue,
-            unresolved, feedback_total, feedback_pos, feedback_neg,
-            feedback_avg, languages, fb_channel, trends, net_impact,
-            name, created_at, bot_created_at, alerts, fb_geo,
-            net_impact_graph, perform_by_geo
-        ) VALUES (
-            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s, %s, %s
+            %s, %s, %s, %s, %s, %s
         );
         """
 
@@ -415,12 +317,7 @@ def insert_metrics_direct(data):
         start_total = time.time()
         logger.info(f"Fast batch inserting {len(data['chatbot_metrics'])} metrics records")
 
-        # Pre-encode static data once - this is the bottleneck!
-        print("Pre-encoding static data...")
-        empty_json = "{}"
-        empty_array = "[]"
-
-        print("Preparing values for batch insertion...")
+        # Process metrics records
         values_list = []
         for metric in data['chatbot_metrics']:
             # Only process essential dynamic data, use empty strings for static JSON to avoid processing
@@ -448,22 +345,23 @@ def insert_metrics_direct(data):
                 metric.get('feedback_neg', 0),                  # 21
                 metric.get('feedback_avg', 0),                  # 22
                 json.dumps(metric.get('languages', {})),        # 23
-                json.dumps(metric.get('fb_channel', [])),       # 24
-                empty_array,                                     # 25 trends
-                float(metric.get('net_impact', 0.0)),           # 26
-                metric.get('name', ''),                         # 27
-                metric.get('created_at'),                       # 28
-                metric.get('bot_created_at', metric.get('snapshot_time')),  # 29
-                empty_array,                                     # 30 alerts
-                empty_array,                                     # 31 fb_geo
-                empty_json,                                      # 32 net_impact_graph
-                empty_array,                                     # 33 perform_by_geo
+                json.dumps(metric.get('alerts', [])),  # 24 alerts - use actual static data
+                json.dumps(metric.get('fb_geo', [])),  # 25 fb_geo - use actual static data
+                json.dumps(metric.get('fb_channel', [])),       # 26
+                json.dumps(metric.get('trends', [])),# 27 trends
+                float(metric.get('net_impact', 0.0)),           # 28
+                json.dumps(metric.get('net_impact_graph', {})),
+                metric.get('name', ''),                         # 30
+                metric.get('created_at'),                       # 31
+                metric.get('bot_created_at', metric.get('snapshot_time')),  # 32
+                json.dumps(metric.get('perform_by_geo', {}))
+
             )
+            
             values_list.append(values)
 
         # Use executemany for batch insertion
         try:
-            logger.info(f"Starting database insert for {len(values_list)} records")
             start_time = time.time()
             cursor.executemany(insert_query, values_list)
             logger.info(f"executemany completed, committing...")

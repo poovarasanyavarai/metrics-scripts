@@ -6,7 +6,7 @@ from datetime import datetime
 import json
 import logging
 from api_calls import fetch_chatbots, fetch_settings, fetch_languages
-from db_calls import fetch_all_data_optimized, get_db_connection, insert_metrics_to_db, insert_metrics_direct
+from db_calls import fetch_all_data_optimized, get_db_connection, insert_metrics_direct
 from static_data import (
     STATIC_FB_GEO,
     STATIC_FB_CHANNEL,
@@ -64,8 +64,8 @@ def generate_json_data():
         conn = get_db_connection()
 
         # Fetch ALL data with optimized queries
-        logger.info("Step 3/4: Fetching conversation and feedback data")
-        today_conversations, yesterday_conversations, feedback_by_chatbot = fetch_all_data_optimized(
+        logger.info("Step 3/4: Fetching conversation, feedback, and leads data")
+        today_conversations, yesterday_conversations, feedback_by_chatbot, today_leads, yesterday_leads = fetch_all_data_optimized(
             chatbot_ids, conn, language_map
         )
         conn.close()
@@ -101,6 +101,11 @@ def generate_json_data():
         yesterday_count = yesterday_data['yesterday_count']
         conversation_diff = today_count - yesterday_count
 
+        # Get leads data
+        today_leads_count = today_leads.get(chatbot_id, 0)
+        yesterday_leads_count = yesterday_leads.get(chatbot_id, 0)
+        leads_diff = today_leads_count - yesterday_leads_count
+
         # Get feedback data
         feedback_data = feedback_by_chatbot.get(chatbot_id, {
             'feedback_total': 0, 'feedback_pos': 0, 'feedback_neg': 0, 'feedback_avg': 0, 'fb_channel': []
@@ -126,8 +131,8 @@ def generate_json_data():
             "ai_resolved_diff": conversation_diff,
             "human_resolved": 0,
             "human_resolved_diff": 0,
-            "leads": 0,
-            "leads_diff": 0,
+            "leads": today_leads_count,
+            "leads_diff": leads_diff,
 
             # CSAT fields
             "ai_csat": ai_csat,
@@ -154,9 +159,9 @@ def generate_json_data():
             "alerts": STATIC_ALERTS,
             "fb_geo": STATIC_FB_GEO,
             "fb_channel": feedback_data.get('fb_channel', []),
-            "trends": STATIC_ALERTS,  # Use alerts as trends
-            "net_impact": round((today_count / today_count * 100) if today_count > 0 else 0, 2),  # Double precision value
-            "net_impact_graph": {"data": [0, 0, 0, 0, 0, 0, 0]},  # Default graph data
+            "trends": STATIC_TRENDS,
+            "net_impact": STATIC_NET_IMPACT.get('efficiency_gain', 0),  # Use efficiency_gain from static data
+            "net_impact_graph": STATIC_NET_IMPACT_GRAPH,
 
             # Name and timestamps
             "name": chatbot_name,
@@ -179,7 +184,9 @@ def generate_json_data():
             "total_today_conversations": sum(r['total_coversation'] for r in data_records),
             "total_yesterday_conversations": sum(yesterday_conversations.get(c.get('id'), {}).get('yesterday_count', 0) for c in chatbots),
             "total_feedback_records": sum(r['feedback_total'] for r in data_records),
-            "database_queries_used": 3,  # Optimized to use only 3 queries with IN operator
+            "total_today_leads": sum(r['leads'] for r in data_records),
+            "total_yesterday_leads": sum(yesterday_leads.get(c.get('id'), 0) for c in chatbots),
+            "database_queries_used": 5,  # Optimized to use 5 queries with IN operator (3 for convs/feedback + 2 for leads)
             "note": "Data formatted for direct INSERT INTO chatbot_metrics"
         }
     }
@@ -206,10 +213,12 @@ def generate_json_data():
     logger.info("="*50)
     logger.info(f"✓ Total chatbots processed: {len(chatbots)}")
     logger.info(f"✓ Snapshot time: {snapshot_time}")
-    logger.info(f"✓ Database queries used: 3 (optimized with IN operator)")
+    logger.info(f"✓ Database queries used: 5 (optimized with IN operator)")
     logger.info(f"✓ Total today conversations: {json_data['metadata']['total_today_conversations']}")
     logger.info(f"✓ Total yesterday conversations: {json_data['metadata']['total_yesterday_conversations']}")
     logger.info(f"✓ Total feedback records: {json_data['metadata']['total_feedback_records']}")
+    logger.info(f"✓ Total today leads: {json_data['metadata']['total_today_leads']}")
+    logger.info(f"✓ Total yesterday leads: {json_data['metadata']['total_yesterday_leads']}")
     logger.info(f"✓ Direct insertion (no intermediate file)")
     logger.info("="*50)
 
