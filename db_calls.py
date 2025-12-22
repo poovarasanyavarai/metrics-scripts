@@ -80,8 +80,8 @@ def fetch_all_data_optimized(chatbot_ids, conn, language_map=None):
         SELECT chatbot_id, COUNT(*) AS today_leads_count
         FROM public.event_scheduler
         WHERE chatbot_id IN ('{chatbot_ids_str}')
-          AND start_time >= CURRENT_DATE
-          AND start_time < CURRENT_DATE + INTERVAL '1 day'
+          AND created_at >= CURRENT_DATE
+          AND created_at < CURRENT_DATE + INTERVAL '1 day'
         GROUP BY chatbot_id
         ORDER BY chatbot_id
     """
@@ -91,8 +91,8 @@ def fetch_all_data_optimized(chatbot_ids, conn, language_map=None):
         SELECT chatbot_id, COUNT(*) AS yesterday_leads_count
         FROM public.event_scheduler
         WHERE chatbot_id IN ('{chatbot_ids_str}')
-          AND start_time >= CURRENT_DATE - INTERVAL '1 day'
-          AND start_time < CURRENT_DATE
+          AND created_at >= CURRENT_DATE - INTERVAL '1 day'
+          AND created_at < CURRENT_DATE
         GROUP BY chatbot_id
         ORDER BY chatbot_id
     """
